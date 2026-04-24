@@ -63,4 +63,4 @@ jobs:
         with:
           app-name: 'dreamitleadapi'
           slot-name: 'Production'
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_D7D8651123D94D92AA56EB3DA1A57D96 }}
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_70E94869FF6E47A8A5F5070F586831CC }}
