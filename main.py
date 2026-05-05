@@ -1,16 +1,20 @@
 import logging
 import os
+import re
 from base64 import b64encode
+from collections import defaultdict, deque
 from functools import lru_cache
+from hashlib import sha256
 from html import escape
 from pathlib import Path
-from time import perf_counter
+from threading import Lock
+from time import monotonic, perf_counter
 
 import msal
 import requests
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI
-from pydantic import BaseModel
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from pydantic import BaseModel, ConfigDict, Field
 
 load_dotenv()
 
@@ -38,13 +42,220 @@ INLINE_LOGO_CID = "dreamit-logo"
 FALLBACK_LOGO_URL = "https://www.dreamitcs.com/wp-content/uploads/2023/05/logo.png"
 REQUEST_TIMEOUT = (5, 20)
 
+EMAIL_RE = re.compile(r"^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$", re.IGNORECASE)
+URL_RE = re.compile(r"(https?://|www\.)", re.IGNORECASE)
+CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def get_int_env(name, default):
+    try:
+        return int(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+LEAD_RATE_LIMIT_WINDOW_SECONDS = get_int_env("LEAD_RATE_LIMIT_WINDOW_SECONDS", 900)
+LEAD_IP_RATE_LIMIT_MAX = get_int_env("LEAD_IP_RATE_LIMIT_MAX", 5)
+LEAD_EMAIL_RATE_LIMIT_MAX = get_int_env("LEAD_EMAIL_RATE_LIMIT_MAX", 2)
+LEAD_DUPLICATE_WINDOW_SECONDS = get_int_env("LEAD_DUPLICATE_WINDOW_SECONDS", 3600)
+
+ALLOWED_ORIGINS = {
+    origin.strip().rstrip("/")
+    for origin in os.getenv("ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+}
+ALLOWED_SERVICES = {
+    service.strip().lower()
+    for service in os.getenv("ALLOWED_SERVICES", "").split(",")
+    if service.strip()
+}
+
+rate_limit_buckets = defaultdict(deque)
+recent_lead_fingerprints = {}
+spam_guard_lock = Lock()
+
 
 class Lead(BaseModel):
-    firstName: str
-    lastName: str
-    email: str
-    selectService: str
-    messages: str
+    model_config = ConfigDict(str_strip_whitespace=True, extra="ignore")
+
+    firstName: str = Field(..., min_length=1, max_length=80)
+    lastName: str = Field("", max_length=80)
+    email: str = Field(..., min_length=3, max_length=254)
+    selectService: str = Field(..., min_length=2, max_length=120)
+    messages: str = Field(..., min_length=5, max_length=2000)
+    website: str = Field("", max_length=200)
+    faxNumber: str = Field("", max_length=100)
+
+
+def clean_single_line(value):
+    cleaned = CONTROL_CHAR_RE.sub("", str(value or "")).strip()
+    return re.sub(r"\s+", " ", cleaned)
+
+
+def clean_message(value):
+    cleaned = CONTROL_CHAR_RE.sub("", str(value or "")).strip()
+    return re.sub(r"\n{3,}", "\n\n", cleaned)
+
+
+def get_client_ip(request):
+    for header in ["cf-connecting-ip", "x-real-ip", "x-forwarded-for"]:
+        value = request.headers.get(header)
+        if value:
+            return value.split(",")[0].strip()
+
+    if request.client and request.client.host:
+        return request.client.host
+
+    return "unknown"
+
+
+def origin_allowed(request):
+    if not ALLOWED_ORIGINS:
+        return True
+
+    origin = request.headers.get("origin")
+    if origin:
+        return origin.rstrip("/") in ALLOWED_ORIGINS
+
+    referer = request.headers.get("referer")
+    if referer:
+        normalized_referer = referer.rstrip("/")
+        return any(normalized_referer.startswith(origin + "/") for origin in ALLOWED_ORIGINS)
+
+    return False
+
+
+def rate_limit_exceeded(key, max_requests, window_seconds):
+    now = monotonic()
+
+    with spam_guard_lock:
+        bucket = rate_limit_buckets[key]
+
+        while bucket and now - bucket[0] > window_seconds:
+            bucket.popleft()
+
+        if len(bucket) >= max_requests:
+            return True
+
+        bucket.append(now)
+        return False
+
+
+def random_token_like(value):
+    text = re.sub(r"[^A-Za-z]", "", value or "")
+
+    if len(text) < 12:
+        return False
+
+    upper_count = sum(char.isupper() for char in text)
+    lower_count = sum(char.islower() for char in text)
+    vowel_count = sum(char.lower() in "aeiou" for char in text)
+    case_switches = sum(
+        left.islower() != right.islower()
+        for left, right in zip(text, text[1:])
+    )
+
+    return (
+        upper_count >= 3
+        and lower_count >= 3
+        and case_switches / max(len(text) - 1, 1) >= 0.35
+        and vowel_count / len(text) <= 0.35
+    )
+
+
+def validate_and_normalize_lead(lead):
+    lead_data = lead.model_dump()
+    normalized = {
+        "firstName": clean_single_line(lead_data.get("firstName")),
+        "lastName": clean_single_line(lead_data.get("lastName")),
+        "email": clean_single_line(lead_data.get("email")).lower(),
+        "selectService": clean_single_line(lead_data.get("selectService")),
+        "messages": clean_message(lead_data.get("messages")),
+    }
+
+    honeypot_values = [
+        clean_single_line(lead_data.get("website")),
+        clean_single_line(lead_data.get("faxNumber")),
+    ]
+
+    if any(honeypot_values):
+        return None, "honeypot field was filled"
+
+    if not EMAIL_RE.match(normalized["email"]):
+        return None, "invalid email address"
+
+    if ALLOWED_SERVICES and normalized["selectService"].lower() not in ALLOWED_SERVICES:
+        return None, "unknown service selected"
+
+    full_name = " ".join(
+        part for part in [normalized["firstName"], normalized["lastName"]] if part
+    )
+    alpha_name_chars = sum(char.isalpha() for char in full_name)
+
+    if alpha_name_chars < 2:
+        return None, "name is too short"
+
+    if URL_RE.search(full_name):
+        return None, "url found in name"
+
+    spam_score = 0
+    spam_signals = []
+    message_without_spaces = re.sub(r"\s+", "", normalized["messages"])
+    email_local = normalized["email"].split("@", 1)[0]
+
+    for field_name in ["firstName", "lastName", "messages"]:
+        if random_token_like(normalized[field_name]):
+            spam_score += 2
+            spam_signals.append(f"{field_name} looks random")
+
+    if len(normalized["messages"]) < 15:
+        spam_score += 1
+        spam_signals.append("message is very short")
+
+    if len(message_without_spaces) >= 12 and " " not in normalized["messages"]:
+        spam_score += 1
+        spam_signals.append("message has no spaces")
+
+    if email_local.count(".") >= 4:
+        spam_score += 1
+        spam_signals.append("email local-part has many dots")
+
+    if URL_RE.search(normalized["messages"]):
+        spam_score += 2
+        spam_signals.append("message contains a url")
+
+    if spam_score >= 3:
+        return None, ", ".join(spam_signals)
+
+    return normalized, None
+
+
+def duplicate_lead_exists(lead_data):
+    fingerprint_source = "|".join(
+        [
+            lead_data["email"],
+            lead_data["selectService"].lower(),
+            lead_data["messages"].lower(),
+        ]
+    )
+    fingerprint = sha256(fingerprint_source.encode("utf-8")).hexdigest()
+    now = monotonic()
+
+    with spam_guard_lock:
+        expired = [
+            stored_fingerprint
+            for stored_fingerprint, timestamp in recent_lead_fingerprints.items()
+            if now - timestamp > LEAD_DUPLICATE_WINDOW_SECONDS
+        ]
+
+        for stored_fingerprint in expired:
+            recent_lead_fingerprints.pop(stored_fingerprint, None)
+
+        if fingerprint in recent_lead_fingerprints:
+            return True
+
+        recent_lead_fingerprints[fingerprint] = now
+        return False
 
 
 @lru_cache(maxsize=1)
@@ -395,8 +606,57 @@ def send_lead_notifications(lead_data):
 
 
 @app.post("/lead")
-def create_lead(lead: Lead, background_tasks: BackgroundTasks):
-    lead_data = lead.model_dump()
+def create_lead(lead: Lead, background_tasks: BackgroundTasks, request: Request):
+    client_ip = get_client_ip(request)
+
+    if not origin_allowed(request):
+        logger.warning("Lead rejected from %s | reason=origin not allowed", client_ip)
+        raise HTTPException(status_code=403, detail="Lead submission rejected.")
+
+    if rate_limit_exceeded(
+        f"ip:{client_ip}",
+        LEAD_IP_RATE_LIMIT_MAX,
+        LEAD_RATE_LIMIT_WINDOW_SECONDS,
+    ):
+        logger.warning("Lead rate limited by ip | ip=%s", client_ip)
+        raise HTTPException(status_code=429, detail="Too many lead submissions.")
+
+    lead_data, rejection_reason = validate_and_normalize_lead(lead)
+
+    if rejection_reason:
+        logger.warning(
+            "Lead rejected from %s | email=%s | reason=%s",
+            client_ip,
+            getattr(lead, "email", ""),
+            rejection_reason,
+        )
+        raise HTTPException(status_code=400, detail="Lead submission rejected.")
+
+    if rate_limit_exceeded(
+        f"email:{lead_data['email']}",
+        LEAD_EMAIL_RATE_LIMIT_MAX,
+        LEAD_RATE_LIMIT_WINDOW_SECONDS,
+    ):
+        logger.warning(
+            "Lead rate limited by email | ip=%s | email=%s",
+            client_ip,
+            lead_data["email"],
+        )
+        raise HTTPException(status_code=429, detail="Too many lead submissions.")
+
+    if duplicate_lead_exists(lead_data):
+        logger.info(
+            "Duplicate lead ignored | ip=%s | email=%s",
+            client_ip,
+            lead_data["email"],
+        )
+        return {
+            "status": "accepted",
+            "message": "Duplicate lead received. Recent notification already exists.",
+            "admin_email": "skipped_duplicate",
+            "user_email": "skipped_duplicate",
+        }
+
     background_tasks.add_task(send_lead_notifications, lead_data)
 
     return {
