@@ -81,6 +81,7 @@ class Lead(BaseModel):
     firstName: str = Field(..., min_length=1, max_length=80)
     lastName: str = Field("", max_length=80)
     email: str = Field(..., min_length=3, max_length=254)
+    phoneNumber: str = Field("", max_length=50)
     selectService: str = Field(..., min_length=2, max_length=120)
     messages: str = Field(..., min_length=5, max_length=2000)
     website: str = Field("", max_length=200)
@@ -169,6 +170,7 @@ def validate_and_normalize_lead(lead):
         "firstName": clean_single_line(lead_data.get("firstName")),
         "lastName": clean_single_line(lead_data.get("lastName")),
         "email": clean_single_line(lead_data.get("email")).lower(),
+        "phoneNumber": clean_single_line(lead_data.get("phoneNumber")),
         "selectService": clean_single_line(lead_data.get("selectService")),
         "messages": clean_message(lead_data.get("messages")),
     }
@@ -309,6 +311,7 @@ def save_to_excel(token, lead):
                 lead.firstName,
                 lead.lastName,
                 lead.email,
+                lead.phoneNumber,
                 lead.selectService,
                 lead.messages,
             ]]
@@ -376,7 +379,7 @@ def format_html_message(value):
     return escape(cleaned).replace("\n", "<br>")
 
 
-def build_details_table(full_name, email, service, message):
+def build_details_table(full_name, email, phone, service, message):
     label_style = (
         "padding:10px 0; width:140px; vertical-align:top; "
         "font-size:14px; line-height:22px; font-weight:600; color:#102a43;"
@@ -396,6 +399,10 @@ def build_details_table(full_name, email, service, message):
             <tr>
                 <td style="{label_style}">Email</td>
                 <td style="{value_style}">{email}</td>
+            </tr>
+            <tr>
+                <td style="{label_style}">Phone</td>
+                <td style="{value_style}">{phone}</td>
             </tr>
             <tr>
                 <td style="{label_style}">Service</td>
@@ -466,9 +473,10 @@ def build_lead_context(lead_data):
     )
     first_name = format_html_text(lead_data.get("firstName"))
     email = format_html_text(lead_data.get("email"))
+    phone = format_html_text(lead_data.get("phoneNumber"))
     service = format_html_text(lead_data.get("selectService"))
     message = format_html_message(lead_data.get("messages"))
-    details_table = build_details_table(full_name, email, service, message)
+    details_table = build_details_table(full_name, email, phone, service, message)
 
     logo_attachment = get_inline_logo_attachment()
     attachments = [logo_attachment] if logo_attachment else None
